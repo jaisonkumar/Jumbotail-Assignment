@@ -1,4 +1,4 @@
-# E-commerce Search Engine Microservice
+# E-commerce Search Engine
 
 A high-performance, intent-aware search engine built with **FastAPI** and **RapidFuzz**. It delivers sub-200ms latency on a catalog of 14,000+ real-world products, featuring intelligent ranking, fuzzy matching, and personalized query understanding.
 
