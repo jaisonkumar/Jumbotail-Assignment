@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pydantic
+thefuzz
+python-multipart
+faker
+numpy
+pandas
