@@ -243,6 +243,13 @@ class SearchService:
                 "cat_penalty": cat_penalty
             })
             
+        # Optimization: Pre-Ranking for broad queries
+        # If we have too many candidates, running full scoring is slow.
+        # Filter top 1000 by simple heuristic (Sales or Rating) first.
+        if len(candidates) > 1000:
+            candidates.sort(key=lambda x: x["product"].sales_count, reverse=True)
+            candidates = candidates[:1000]
+            
         # Pass 2: Heavy Scoring on Candidates
         scored_results = []
         
