@@ -153,40 +153,45 @@ class SearchService:
             
         return profile, constraints
 
+    def _normalize_token(self, token: str) -> str:
+        """Unify spec tokens e.g. '256 gb' -> '256gb'"""
+        # Collapse space between number and unit
+        return re.sub(r'(\d+)\s+(gb|mb|tb|mm|mah)', r'\1\2', token)
+
     def _calculate_token_relevance(self, query: str, product: Product) -> Tuple[float, float]:
         """
         2. separate Match Quality from Coverage.
         Returns: (quality_score, coverage_score)
         """
-        query_tokens = query.lower().split()
+        # 1. Token Coverage Refinement: Normalize and Include Metadata
+        normalized_query = self._normalize_token(query.lower())
+        query_tokens = normalized_query.split()
         if not query_tokens:
             return 0.0, 0.0
             
         total_weight = 0.0
         matched_weight = 0.0
-        quality_accum = 0.0
         
-        text = (product.title + " " + product.description).lower()
+        # Construct full search text including metadata
+        meta_values = " ".join([str(v) for v in product.Metadata.values()])
+        text = self._normalize_token((product.title + " " + product.description + " " + meta_values).lower())
         
         for token in query_tokens:
             weight = self.TOKEN_WEIGHTS.get(token, 1.0)
             total_weight += weight
             
-            # Check for partial match using rapidfuzz logic equivalent
-            # For performance, we do a simple substring check first or strict match
+            # Use wider check (substring match in full text)
             if token in text:
                 matched_weight += weight
-                quality_accum += 1.0 * weight # Perfect match
             else:
-                # Fuzzy fallback handled by main relevance score, 
-                # here we are measuring explicit token coverage
                 pass
                 
         coverage_score = (matched_weight / total_weight) * 100 if total_weight > 0 else 0
         
         # Base fuzzy score for "Quality"
         # We assume if coverage is high, quality is high, but text fuzziness refines it
-        quality_score = fuzz.token_set_ratio(query, product.title)
+        # Fuzz title match against query
+        quality_score = fuzz.token_set_ratio(normalized_query, product.title.lower())
         
         return quality_score, coverage_score
     
@@ -196,6 +201,14 @@ class SearchService:
         if not intended_cat:
             return False
             
+        # 2. Category Detection: Use explicit field first
+        prod_cat = product.Metadata.get("category", "")
+        if prod_cat:
+            if intended_cat == "phone" and prod_cat != "phone": return True
+            if intended_cat == "accessory" and prod_cat != "accessory": return True
+            return False
+
+        # Fallback to title keywords if explicit category missing
         is_accessory_prod = any(x in product.title.lower() for x in ["cover", "case", "glass", "guard", "protector"])
         
         if intended_cat == "phone" and is_accessory_prod:
@@ -253,6 +266,14 @@ class SearchService:
         # Pass 2: Heavy Scoring on Candidates
         scored_results = []
         
+        # 3. Adaptive Budgeting: Calculate median price of candidates for relative contexts
+        median_price = 30000 
+        if candidates:
+            prices = sorted([c["product"].price for c in candidates])
+            median_price = prices[len(prices)//2]
+
+        seen_models = set()
+        
         for item in candidates:
             p = item["product"]
             reasons = []
@@ -298,7 +319,7 @@ class SearchService:
                 score -= 30
                 reasons.append("High Returns")
             
-            # --- Price Logic ---
+            # --- Price Logic (Adaptive) ---
             # 10. Non-linear Price Sensitivity
             price_limit = constraints.get("price_limit")
             if price_limit:
@@ -307,25 +328,41 @@ class SearchService:
                     reasons.append("Within Budget")
                 else:
                     # Soft penalty: decay as price moves away
-                    diff_ratio = (p.price - price_limit) / price_limit
+                    diff_ratio = (p.price - price_limit) / (price_limit + 1)
                     penalty = 20 + (diff_ratio * 50)
                     score -= penalty
             
             if profile_name == "Budget":
-                # Sweet spot logic: lower is better, but too low might be junk (not modeled here yet)
-                # Linear decay for budget profile
-                score += ((50000 - p.price) / 1000) * profile.price_weight
+                # Sweet spot is median or lower
+                # If price is lower than median, boost.
+                if p.price < median_price:
+                    score += 15
+                elif p.price > median_price * 1.5:
+                    score -= 10
             elif profile_name == "Premium":
                 # Higher price is good signal for premium
-                score += (p.price / 1000) * 0.5 
+                if p.price > median_price:
+                    score += 15
                 
             # Apply Category Penalty
             score -= item["cat_penalty"]
             if item["cat_penalty"] > 0:
                 reasons.append("Category Mismatch")
+
+            # 5. Diversity Guardrail
+            # Penalize if we've seen this model base already to prevent clutter
+            # Assuming title "Brand ModelVariant ..." -> extract "Brand Model" roughly
+            model_key = " ".join(p.title.split()[:2]) 
+            if model_key in seen_models:
+                score -= 15 # Diversity penalty
+            seen_models.add(model_key)
                 
-            # 13. Confidence Score
-            confidence = min(100, max(0, text_score))
+            # 13. Confidence Score (Composite)
+            # Relevance + Intent Satisfaction + Metadata Health
+            confidence = (text_score * 0.6) + (20 if not reasons else 0) # Placeholder logic enhancement
+            if "Within Budget" in reasons: confidence += 10
+            if "Category Mismatch" not in reasons: confidence += 10
+            confidence = min(100, max(0, confidence))
             
             scored_results.append({
                 "product": p,
@@ -346,10 +383,15 @@ class SearchService:
         final_list = []
         for item in scored_results[:limit]:
             p = item["product"]
-            # Injecting into metadata for frontend visibility
-            p.Metadata["ranking_reasons"] = item["reasons"]
-            p.Metadata["confidence"] = f"{item['confidence']:.1f}%"
-            final_list.append(p)
+            # 6. Fix Mutation: Clone properly to avoid side effects
+            # Create a lightweight dict copy for response or shallow copy object
+            # For simplicity in this Pydantic/Dict hybrid setup:
+            p_response = p.copy() 
+            p_response.Metadata = p.Metadata.copy() # Shallow copy of dict
+            
+            p_response.Metadata["ranking_reasons"] = item["reasons"]
+            p_response.Metadata["confidence"] = f"{item['confidence']:.1f}%"
+            final_list.append(p_response)
             
         return final_list
 
