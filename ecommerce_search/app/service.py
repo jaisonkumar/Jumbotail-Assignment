@@ -2,6 +2,7 @@ import random
 import re
 import math
 from typing import List, Dict, Any, Tuple
+from datetime import datetime, timedelta
 from .database import db
 from .models import Product
 from rapidfuzz import fuzz
@@ -218,6 +219,24 @@ class SearchService:
             
         return False
 
+    def _calculate_recency_boost(self, product: Product) -> Tuple[float, bool]:
+        """
+        Calculate recency boost for newly launched products.
+        Returns: (boost_score, is_new_product)
+        """
+        if not product.launch_date:
+            return 0.0, False
+        
+        days_since_launch = (datetime.now() - product.launch_date).days
+        
+        # Product is "new" if launched within 30 days
+        is_new = days_since_launch <= 30
+        
+        # Exponential decay: 50 points at day 0, ~5 points at day 60
+        boost = max(0, 50 * math.exp(-days_since_launch / 30))
+        
+        return boost, is_new
+
     def search(self, query: str, limit: int = 20) -> List[dict]:
         all_products = db.get_all_products()
         query = query.strip()
@@ -288,39 +307,71 @@ class SearchService:
             if text_score > 80:
                 reasons.append("High Match")
             
+            # --- Recency Boost for New Launches ---
+            recency_boost, is_new_product = self._calculate_recency_boost(p)
+            score += recency_boost
+            
+            if recency_boost > 20:
+                reasons.append("New Launch")
+            elif recency_boost > 5:
+                reasons.append("Recent")
+            
             # --- Business Metrics ---
             
             # 9. Popularity Momentum
             # Blend total sales + recent sales * multiplier
             popularity_score = math.log(p.sales_count + 1) + (math.log(p.recent_sales_count + 1) * 2)
-            score += (popularity_score * 2.0 * profile.sales_weight)
+            
+            # For new products, use minimum baseline to avoid penalizing zero sales
+            if is_new_product:
+                popularity_score = max(popularity_score, 5.0)  # Baseline boost for new products
+            
+            popularity_score_weighted = (popularity_score * 2.0 * profile.sales_weight)
+            score += popularity_score_weighted
             
             if p.recent_sales_count > 100:
                 reasons.append("Trending")
             
-            # Rating Boost
-            score += (p.rating * 5.0 * profile.rating_weight)
-            if p.rating > 4.5:
-                reasons.append("Top Rated")
-
-            # 7. Stock Saturation
-            # Out (-50), Low (<10, -10), Healthy (>10, +10)
-            if p.stock == 0:
-                score -= 50
-                reasons.append("Out of Stock")
-            elif p.stock < 10:
-                score -= 10
+            # Rating Boost (with exemption for new products)
+            rating_score = 0
+            if is_new_product and p.rating == 0:
+                # New product with no reviews yet - use neutral baseline
+                rating_score = (4.0 * 5.0 * profile.rating_weight)  # Assume 4.0 baseline
             else:
-                score += 10
+                rating_score = (p.rating * 5.0 * profile.rating_weight)
+                if p.rating > 4.5:
+                    reasons.append("Top Rated")
+            score += rating_score
+
+            # 7. Stock Saturation (with exemption for new products)
+            stock_penalty = 0
+            if not is_new_product:
+                # Apply stock penalties only to mature products
+                if p.stock == 0:
+                    stock_penalty = -50
+                    reasons.append("Out of Stock")
+                elif p.stock < 10:
+                    stock_penalty = -10
+                else:
+                    stock_penalty = 10
+            else:
+                # New products: no stock penalty, but inform user
+                if p.stock == 0:
+                    reasons.append("Pre-order/Coming Soon")
+                elif p.stock > 10:
+                    stock_penalty = 10
+            score += stock_penalty
                 
             # 8. Negative Signals
-            # Return Rate > 10% -> Heavy penalty
+            return_penalty = 0
             if p.return_rate > 0.10:
-                score -= 30
+                return_penalty = -30
                 reasons.append("High Returns")
+            score += return_penalty
             
             # --- Price Logic (Adaptive) ---
             # 10. Non-linear Price Sensitivity
+            price_adjustment = 0
             price_limit = constraints.get("price_limit")
             if price_limit:
                 if p.price <= price_limit:
@@ -369,28 +420,85 @@ class SearchService:
                 "score": score,
                 "confidence": confidence,
                 "reasons": reasons[:3], # 12. Top 3 reasons
-                "debug_score": score
+                "debug_score": score,
+                "components": {
+                    "text": text_score,
+                    "popularity": popularity_score_weighted,
+                    "rating": rating_score,
+                    "recency": recency_boost,
+                    "stock": stock_penalty,
+                    "returns": return_penalty,
+                    "price": price_adjustment # We should track this too
+                }
             })
             
         # Sort
         scored_results.sort(key=lambda x: x["score"], reverse=True)
         
-        # Format for output (Product object usually doesn't take extra fields easily if strictly typed, 
-        # so we might need to rely on Metadata or just return the object.
-        # The prompt asked to "generate explainable output". 
-        # I will inject reasons into Metadata for display purposes.)
-        
+        # --- Aggregated Comparative Ranking Analysis ---
+        # Explain why Result[i] is better than the AVERAGE of all results Below it
+        results_to_analyze = scored_results[:limit]
+        for i in range(len(results_to_analyze) - 1):
+            curr = results_to_analyze[i]
+            others = results_to_analyze[i+1:]
+            
+            if not others:
+                continue
+                
+            # Calculate Averages for the "Rest"
+            avg_text = sum(o["components"]["text"] for o in others) / len(others)
+            avg_sales = sum(o["product"].sales_count for o in others) / len(others)
+            avg_rating = sum(o["product"].rating for o in others) / len(others)
+            avg_returns = sum(o["product"].return_rate for o in others) / len(others)
+            
+            # Calculate Deltas
+            text_diff = curr["components"]["text"] - avg_text
+            
+            sales_delta_pct = 0
+            if avg_sales > 0:
+                sales_delta_pct = ((curr["product"].sales_count - avg_sales) / avg_sales) * 100
+            else:
+                sales_delta_pct = curr["product"].sales_count * 100 # Fallback
+                
+            rating_diff = curr["product"].rating - avg_rating
+            return_diff = (avg_returns - curr["product"].return_rate) * 100 # Positive means better (lower returns)
+            
+            # Select top 2 differentiators
+            diffs = []
+            if text_diff > 5:
+                diffs.append(f"{text_diff:.0f}% better keyword match")
+            if sales_delta_pct > 10:
+                diffs.append(f"{sales_delta_pct:.0f}% higher sales demand")
+            if rating_diff > 0.3:
+                diffs.append(f"+{rating_diff:.1f} higher rating")
+            if return_diff > 0.5:
+                diffs.append(f"{return_diff:.1f}% lower return rate")
+                
+            if not diffs:
+                # Fallback to absolute best factor
+                best_factor = "overall relevance"
+                if text_diff > 0: best_factor = "text relevance"
+                elif sales_delta_pct > 0: best_factor = "popularity"
+                diffs.append(f"Superior {best_factor}")
+            
+            # Construct Edge Message
+            edge = "Outperforms below results with " + " and ".join(diffs[:2])
+            curr["comparative_edge"] = edge
+
+        # Final result check
+        if results_to_analyze:
+            results_to_analyze[-1]["comparative_edge"] = "Top-tier reliability and relevance for this query"
+
+        # Format for output
         final_list = []
         for item in scored_results[:limit]:
             p = item["product"]
-            # 6. Fix Mutation: Clone properly to avoid side effects
-            # Create a lightweight dict copy for response or shallow copy object
-            # For simplicity in this Pydantic/Dict hybrid setup:
             p_response = p.copy() 
-            p_response.Metadata = p.Metadata.copy() # Shallow copy of dict
+            p_response.Metadata = p.Metadata.copy() 
             
             p_response.Metadata["ranking_reasons"] = item["reasons"]
             p_response.Metadata["confidence"] = f"{item['confidence']:.1f}%"
+            p_response.Metadata["comparative_edge"] = item.get("comparative_edge", "")
             final_list.append(p_response)
             
         return final_list

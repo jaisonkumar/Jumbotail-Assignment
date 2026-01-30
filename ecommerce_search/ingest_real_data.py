@@ -2,6 +2,7 @@ import json
 import random
 import os
 import sys
+from datetime import datetime, timedelta
 
 # Setup paths
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
@@ -10,11 +11,16 @@ from app.models import Product
 
 def ingest_data():
     print("Loading devices.json...")
+    
+    # Get the directory where this script is located
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    devices_path = os.path.join(script_dir, "devices.json")
+    
     try:
-        with open("ecommerce_search/devices.json", "r", encoding="utf-8") as f:
+        with open(devices_path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
-        print("devices.json not found. Run curl command first.")
+        print(f"devices.json not found at {devices_path}. Run curl command first.")
         return
 
     print(f"Found {len(data)} brands/series.")
@@ -89,6 +95,7 @@ def ingest_data():
                 recent_sales_count=random.randint(0, 500),
                 return_rate=random.uniform(0.0, 0.1),
                 complaint_count=random.randint(0, 10),
+                launch_date=launch_date,
                 Metadata={
                     "brand": brand,
                     "color": color, 
